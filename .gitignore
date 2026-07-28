@@ -1,0 +1,6 @@
+app/.venv/
+__pycache__/
+*.pyc
+.env
+product/test-files/*
+!product/test-files/.gitkeep
