@@ -4,3 +4,4 @@ __pycache__/
 .env
 product/test-files/*
 !product/test-files/.gitkeep
+.streamlit/secrets.toml

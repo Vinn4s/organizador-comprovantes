@@ -1,15 +1,437 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import uuid
+from collections.abc import MutableMapping
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
 import fitz
 import pandas as pd
 import pytesseract
+import requests
 import streamlit as st
 from openpyxl.styles import Font
 from PIL import Image
+
+
+MERCADO_PAGO_PREFERENCES_URL = (
+    "https://api.mercadopago.com/checkout/preferences"
+)
+MERCADO_PAGO_PAYMENTS_SEARCH_URL = (
+    "https://api.mercadopago.com/v1/payments/search"
+)
+PAYMENT_TIMEOUT_SECONDS = 15
+PAYMENT_CURRENCY = "BRL"
+PAYMENT_STATE_DEFAULTS = {
+    "documents_dataframe": None,
+    "excel_file": None,
+    "external_reference": None,
+    "preference_id": None,
+    "payment_url": None,
+    "payment_status": None,
+    "payment_approved": False,
+    "expected_payment_amount": None,
+}
+PUBLIC_MASKED_PREVIEW_COLUMNS = [
+    "Data",
+    "Valor",
+    "Tipo",
+    "Pagador",
+    "Recebedor",
+    "Descrição",
+    "Possível duplicidade",
+]
+PUBLIC_FOUND_FIELD_COLUMNS = [
+    "Data",
+    "Valor",
+    "Tipo",
+    "Pagador",
+    "Recebedor",
+    "Descrição",
+]
+
+
+class PaymentServiceError(Exception):
+    """Erro seguro para exibição durante a comunicação de pagamento."""
+
+
+def is_sandbox_environment(environment: str) -> bool:
+    """Indica se o ambiente pode exibir diagnósticos restritos de pagamento."""
+    return environment.lower() in {"sandbox", "test", "teste"}
+
+
+def redact_payment_diagnostic(value: object) -> str:
+    """Remove valores de credenciais de um diagnóstico remoto limitado."""
+    sensitive_key_pattern = re.compile(
+        r"authorization|access[_ -]?token|api[_ -]?key|secret",
+        re.IGNORECASE,
+    )
+
+    def redact(item: object) -> object:
+        if isinstance(item, dict):
+            return {
+                str(key): redact(nested_value)
+                for key, nested_value in item.items()
+                if not sensitive_key_pattern.search(str(key))
+            }
+        if isinstance(item, list):
+            return [redact(nested_value) for nested_value in item]
+        if isinstance(item, str):
+            item = re.sub(
+                r"(?i)authorization\s*[:=]\s*[^\s,;]+(?:\s+[^\s,;]+)?",
+                "[credencial ocultada]",
+                item,
+            )
+            item = re.sub(
+                r"(?i)access[_ -]?token\s*[=:]\s*[^\s,;]+",
+                "[credencial ocultada]",
+                item,
+            )
+            item = re.sub(
+                r"(?i)bearer\s+[^\s,;]+",
+                "[credencial ocultada]",
+                item,
+            )
+        return item
+
+    safe_value = redact(value)
+    if isinstance(safe_value, (dict, list)):
+        return json.dumps(safe_value, ensure_ascii=False)
+    return str(safe_value)
+
+
+def payment_preference_error_message(
+    response: requests.Response | None,
+    environment: str,
+) -> str:
+    """Monta erro de preferência seguro, detalhado somente em sandbox."""
+    generic_message = (
+        "Não foi possível iniciar o pagamento agora. Tente novamente."
+    )
+    if not is_sandbox_environment(environment) or response is None:
+        return generic_message
+
+    details = [f"HTTP {response.status_code}"]
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+
+    if isinstance(body, dict):
+        for field in ("message", "error", "cause"):
+            if field in body:
+                details.append(
+                    f"{field}: {redact_payment_diagnostic(body[field])}"
+                )
+
+    return f"{generic_message} Diagnóstico sandbox: {'; '.join(details)}."
+
+
+def select_package(file_count: int) -> tuple[str, float]:
+    """Retorna o pacote e o valor aplicáveis à quantidade de arquivos."""
+    if not 1 <= file_count <= 300:
+        raise ValueError("Envie entre 1 e 300 arquivos por lote.")
+
+    if file_count <= 15:
+        return "1 a 15 arquivos", 19.90
+    if file_count <= 50:
+        return "16 a 50 arquivos", 49.90
+    if file_count <= 120:
+        return "51 a 120 arquivos", 99.90
+
+    return "121 a 300 arquivos", 199.90
+
+
+def expected_payment_amount(file_count: int) -> Decimal:
+    """Converte o preço do pacote em Decimal, sem comparação de float."""
+    _, price = select_package(file_count)
+    return Decimal(str(price)).quantize(Decimal("0.01"))
+
+
+def payment_amount_matches(
+    transaction_amount: object,
+    expected_amount: Decimal,
+) -> bool:
+    """Compara valores monetários com precisão decimal."""
+    if isinstance(transaction_amount, bool):
+        return False
+
+    try:
+        amount = Decimal(str(transaction_amount))
+    except (InvalidOperation, ValueError):
+        return False
+
+    return amount.is_finite() and amount == expected_amount
+
+
+def _public_display_text(value: object) -> str:
+    """Normaliza um valor escalar para uso apenas na amostra mascarada."""
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def mask_public_date(value: object) -> str:
+    """Mantém somente o dia de uma data na prévia pública."""
+    text = _public_display_text(value)
+    match = re.match(r"(\d{1,2})/\d{1,2}/\d{2,4}", text)
+    return f"{match.group(1)}/**/****" if match else "***"
+
+
+def mask_public_value(value: object) -> str:
+    """Oculta integralmente o valor monetário na prévia pública."""
+    return "R$ **,**" if _public_display_text(value) else ""
+
+
+def mask_public_name(value: object) -> str:
+    """Mantém no máximo três caracteres de cada palavra de um nome."""
+    return " ".join(
+        f"{word[:3]}***"
+        for word in _public_display_text(value).split()
+    )
+
+
+def mask_public_description(value: object) -> str:
+    """Mostra somente duas palavras parcialmente mascaradas da descrição."""
+    return " ".join(
+        f"{word[:3]}***"
+        for word in _public_display_text(value).split()[:2]
+    )
+
+
+def public_found_fields(dataframe: pd.DataFrame) -> list[str]:
+    """Lista somente nomes dos campos que tiveram conteúdo extraído."""
+    return [
+        column
+        for column in PUBLIC_FOUND_FIELD_COLUMNS
+        if column in dataframe.columns
+        and dataframe[column].map(_public_display_text).ne("").any()
+    ]
+
+
+def create_public_masked_preview(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Cria uma cópia segura de uma única linha para a interface pública."""
+    available_columns = [
+        column
+        for column in PUBLIC_MASKED_PREVIEW_COLUMNS
+        if column in dataframe.columns
+    ]
+    preview = dataframe.loc[:, available_columns].head(1).copy()
+
+    if preview.empty:
+        return preview
+
+    if "Data" in preview:
+        preview["Data"] = preview["Data"].map(mask_public_date)
+    if "Valor" in preview:
+        preview["Valor"] = preview["Valor"].map(mask_public_value)
+    for column in ("Pagador", "Recebedor"):
+        if column in preview:
+            preview[column] = preview[column].map(mask_public_name)
+    if "Descrição" in preview:
+        preview["Descrição"] = preview["Descrição"].map(
+            mask_public_description
+        )
+
+    return preview
+
+
+def initialize_session_state(state: MutableMapping[str, object]) -> None:
+    """Inicializa o estado usado pelos modos interno e público."""
+    for key, value in PAYMENT_STATE_DEFAULTS.items():
+        state.setdefault(key, value)
+
+
+def reset_payment_state(
+    state: MutableMapping[str, object],
+    file_count: int | None = None,
+) -> None:
+    """Inicia o estado de pagamento de um novo lote."""
+    state["external_reference"] = str(uuid.uuid4())
+    state["preference_id"] = None
+    state["payment_url"] = None
+    state["payment_status"] = None
+    state["payment_approved"] = False
+    state["expected_payment_amount"] = (
+        expected_payment_amount(file_count)
+        if file_count is not None
+        else None
+    )
+
+
+def create_payment_preference(
+    external_reference: str,
+    file_count: int,
+) -> tuple[str, str]:
+    """Cria uma preferência Checkout Pro sem expor detalhes sensíveis."""
+    _, price = select_package(file_count)
+    access_token = st.secrets["MERCADO_PAGO_ACCESS_TOKEN"]
+    environment = str(
+        st.secrets.get("PAYMENT_ENVIRONMENT", "production")
+    ).lower()
+    payload = {
+        "items": [
+            {
+                "id": "organizacao-comprovantes",
+                "title": "Organização de comprovantes",
+                "quantity": 1,
+                "currency_id": "BRL",
+                "unit_price": price,
+            }
+        ],
+        "external_reference": external_reference,
+    }
+
+    response: requests.Response | None = None
+    try:
+        response = requests.post(
+            MERCADO_PAGO_PREFERENCES_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            json=payload,
+            timeout=PAYMENT_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        preference = response.json()
+    except requests.HTTPError as error:
+        failed_response = (
+            error.response if error.response is not None else response
+        )
+        raise PaymentServiceError(
+            payment_preference_error_message(failed_response, environment)
+        ) from error
+    except (requests.RequestException, ValueError) as error:
+        raise PaymentServiceError(
+            "Não foi possível iniciar o pagamento agora. Tente novamente."
+        ) from error
+
+    if not isinstance(preference, dict):
+        raise PaymentServiceError(
+            "O pagamento não pôde ser preparado. Tente novamente."
+        )
+
+    preference_id = preference.get("id")
+    if environment in {"sandbox", "test", "teste"}:
+        payment_url = (
+            preference.get("sandbox_init_point")
+            or preference.get("init_point")
+        )
+    else:
+        payment_url = preference.get("init_point")
+
+    if not isinstance(preference_id, str) or not isinstance(
+        payment_url,
+        str,
+    ):
+        raise PaymentServiceError(
+            "O pagamento não pôde ser preparado. Tente novamente."
+        )
+
+    return preference_id, payment_url
+
+
+def ensure_payment_preference(
+    state: MutableMapping[str, object],
+    file_count: int,
+) -> tuple[str, str]:
+    """Cria a preferência apenas se o lote ainda não possuir uma."""
+    preference_id = state.get("preference_id")
+    payment_url = state.get("payment_url")
+
+    if not isinstance(state.get("expected_payment_amount"), Decimal):
+        state["expected_payment_amount"] = expected_payment_amount(file_count)
+
+    if isinstance(preference_id, str) and isinstance(payment_url, str):
+        return preference_id, payment_url
+
+    external_reference = state.get("external_reference")
+    if not isinstance(external_reference, str):
+        external_reference = str(uuid.uuid4())
+        state["external_reference"] = external_reference
+
+    preference_id, payment_url = create_payment_preference(
+        external_reference,
+        file_count,
+    )
+    state["preference_id"] = preference_id
+    state["payment_url"] = payment_url
+    state["payment_status"] = "pending"
+
+    return preference_id, payment_url
+
+
+def check_payment_status(
+    external_reference: str,
+    expected_amount: Decimal,
+    expected_currency: str = PAYMENT_CURRENCY,
+) -> str:
+    """Libera somente pagamentos aprovados e idênticos ao pedido esperado."""
+    access_token = st.secrets["MERCADO_PAGO_ACCESS_TOKEN"]
+
+    try:
+        response = requests.get(
+            MERCADO_PAGO_PAYMENTS_SEARCH_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"external_reference": external_reference},
+            timeout=PAYMENT_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise PaymentServiceError(
+            "Não foi possível consultar o pagamento agora. Tente novamente."
+        ) from error
+
+    if not isinstance(result, dict):
+        raise PaymentServiceError(
+            "A resposta do pagamento não pôde ser validada."
+        )
+
+    payments = result.get("results", [])
+    if not isinstance(payments, list):
+        raise PaymentServiceError(
+            "A resposta do pagamento não pôde ser validada."
+        )
+
+    if any(
+        isinstance(payment, dict)
+        and payment.get("status") == "approved"
+        and payment.get("external_reference") == external_reference
+        and payment.get("currency_id") == expected_currency
+        and payment_amount_matches(
+            payment.get("transaction_amount"),
+            expected_amount,
+        )
+        for payment in payments
+    ):
+        return "approved"
+
+    return "pending" if payments else "not_found"
+
+
+def refresh_payment_status(state: MutableMapping[str, object]) -> str:
+    """Atualiza o estado local de liberação do download."""
+    if state.get("payment_approved"):
+        return "approved"
+
+    external_reference = state.get("external_reference")
+    expected_amount = state.get("expected_payment_amount")
+    if not isinstance(external_reference, str) or not isinstance(
+        expected_amount,
+        Decimal,
+    ):
+        return "not_found"
+
+    status = check_payment_status(
+        external_reference,
+        expected_amount,
+        PAYMENT_CURRENCY,
+    )
+    state["payment_status"] = status
+    state["payment_approved"] = status == "approved"
+    return status
 
 
 st.set_page_config(
@@ -698,22 +1120,10 @@ def generate_excel(dataframe: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-st.title("Organizador de Comprovantes")
-st.caption(
-    "Envie comprovantes em PDF ou imagem para iniciar a organização."
-)
-
-uploaded_files = st.file_uploader(
-    "Selecione os documentos",
-    type=["pdf", "png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-)
-
-if not uploaded_files:
-    st.info("Nenhum documento enviado ainda.")
-    st.stop()
-
-if st.button("Ler documentos", type="primary"):
+def process_documents(
+    uploaded_files: list[st.runtime.uploaded_file_manager.UploadedFile],
+) -> pd.DataFrame:
+    """Executa a extração documental já existente para um lote enviado."""
     documents: list[dict[str, object]] = []
     file_hashes: list[str] = []
 
@@ -806,27 +1216,11 @@ if st.button("Ler documentos", type="primary"):
 
     mark_possible_duplicates(documents, file_hashes)
 
-    dataframe = pd.DataFrame(documents)
+    return pd.DataFrame(documents)
 
-    st.session_state["documents_dataframe"] = dataframe
 
-if "documents_dataframe" in st.session_state:
-    dataframe = st.session_state["documents_dataframe"]
-
-    st.success(
-        f"{len(dataframe)} documento(s) processado(s)."
-    )
-
-    edited_dataframe = st.data_editor(
-        dataframe,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key="documents_editor",
-    )
-
-    excel_file = generate_excel(edited_dataframe)
-
+def download_excel_button(excel_file: bytes) -> None:
+    """Exibe o download do Excel completo quando ele estiver liberado."""
     st.download_button(
         label="Baixar planilha Excel",
         data=excel_file,
@@ -839,31 +1233,188 @@ if "documents_dataframe" in st.session_state:
         type="primary",
     )
 
-    st.subheader("Prévia da organização")
 
+def render_internal_mode(dataframe: pd.DataFrame) -> None:
+    """Mantém a experiência integral destinada ao uso interno."""
+    st.success(f"{len(dataframe)} documento(s) processado(s).")
+
+    edited_dataframe = st.data_editor(
+        dataframe,
+        width="stretch",
+        hide_index=True,
+        num_rows="dynamic",
+        key="documents_editor",
+    )
+    excel_file = generate_excel(edited_dataframe)
+    st.session_state["excel_file"] = excel_file
+    download_excel_button(excel_file)
+
+    st.subheader("Prévia da organização")
     st.dataframe(
         edited_dataframe,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
     st.subheader("Verificação da leitura")
-
     selected_file = st.selectbox(
         "Escolha um documento para visualizar o texto extraído",
-        options=edited_dataframe[
-            "Arquivo original"
-        ].tolist(),
+        options=edited_dataframe["Arquivo original"].tolist(),
     )
-
     selected_row = edited_dataframe[
-        edited_dataframe["Arquivo original"]
-        == selected_file
+        edited_dataframe["Arquivo original"] == selected_file
     ].iloc[0]
-
     st.text_area(
         "Texto identificado no documento",
         value=str(selected_row["Texto extraído"]),
         height=300,
         disabled=True,
     )
+
+
+def render_payment_status() -> None:
+    """Verifica pagamentos sem executar novamente o processamento de OCR."""
+    state = st.session_state
+    if state["payment_approved"]:
+        return
+
+    try:
+        status = refresh_payment_status(state)
+    except (KeyError, PaymentServiceError) as error:
+        state["payment_status"] = "error"
+        st.warning(str(error))
+        return
+
+    if status == "approved":
+        st.success("Pagamento confirmado. Sua planilha completa foi liberada.")
+    elif status == "pending":
+        st.info("Pagamento ainda pendente de confirmação.")
+    else:
+        st.info("Ainda não localizamos um pagamento para este pedido.")
+
+
+def render_public_mode(dataframe: pd.DataFrame) -> None:
+    """Mostra somente a prévia permitida até a confirmação do pagamento."""
+    file_count = len(dataframe)
+    package_name, price = select_package(file_count)
+    if not isinstance(st.session_state["expected_payment_amount"], Decimal):
+        st.session_state["expected_payment_amount"] = (
+            expected_payment_amount(file_count)
+        )
+    text_found_count = int(
+        dataframe["Status da leitura"].eq("Texto encontrado").sum()
+    )
+    duplicate_count = int(
+        dataframe["Possível duplicidade"].eq("Sim").sum()
+    )
+
+    st.warning(
+        "Não feche nem recarregue esta página até concluir o pagamento "
+        "e baixar sua planilha."
+    )
+    st.success(f"{file_count} documento(s) processado(s).")
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Arquivos", file_count)
+    metric_columns[1].metric("Com texto encontrado", text_found_count)
+    metric_columns[2].metric("Possíveis duplicidades", duplicate_count)
+    metric_columns[3].metric("Valor", f"R$ {price:.2f}".replace(".", ","))
+    st.caption(f"Pacote selecionado: {package_name}")
+
+    if st.session_state["payment_approved"]:
+        st.success("Pagamento confirmado. Sua planilha completa está pronta.")
+        excel_file = st.session_state["excel_file"]
+        if isinstance(excel_file, bytes):
+            download_excel_button(excel_file)
+        return
+
+    st.subheader("Amostra mascarada da organização")
+    found_fields = public_found_fields(dataframe)
+    if found_fields:
+        st.caption("Campos encontrados: " + ", ".join(found_fields))
+    else:
+        st.caption("Nenhum campo estruturado foi encontrado.")
+
+    masked_preview = create_public_masked_preview(dataframe)
+    if not masked_preview.empty:
+        st.dataframe(
+            masked_preview,
+            width="stretch",
+            hide_index=True,
+        )
+
+    if not st.session_state["payment_url"]:
+        if st.button("Ir para pagamento", type="primary"):
+            try:
+                ensure_payment_preference(st.session_state, file_count)
+            except KeyError:
+                st.error(
+                    "Não foi possível iniciar o pagamento agora. "
+                    "Tente novamente."
+                )
+            except PaymentServiceError as error:
+                st.error(str(error))
+            else:
+                st.rerun()
+
+    payment_url = st.session_state["payment_url"]
+    if isinstance(payment_url, str):
+        st.link_button("Abrir pagamento em nova aba", payment_url)
+        st.caption(
+            "Conclua o pagamento na nova aba e volte aqui para confirmar."
+        )
+
+        @st.fragment(run_every="15s")
+        def payment_status_fragment() -> None:
+            if st.button("Verificar pagamento agora"):
+                render_payment_status()
+            elif not st.session_state["payment_approved"]:
+                render_payment_status()
+
+            if st.session_state["payment_approved"]:
+                st.rerun()
+
+        payment_status_fragment()
+
+
+def main() -> None:
+    """Renderiza o modo interno ou público sem persistir arquivos enviados."""
+    PUBLIC_MODE = st.secrets.get("PUBLIC_MODE", False)
+    initialize_session_state(st.session_state)
+
+    st.title("Organizador de Comprovantes")
+    st.caption(
+        "Envie comprovantes em PDF ou imagem para iniciar a organização."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Selecione os documentos",
+        type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+    )
+
+    if not uploaded_files:
+        st.info("Nenhum documento enviado ainda.")
+        return
+
+    if len(uploaded_files) > 300:
+        st.error("O limite é de 300 arquivos por lote.")
+    elif st.button("Ler documentos", type="primary"):
+        dataframe = process_documents(uploaded_files)
+        st.session_state["documents_dataframe"] = dataframe
+        st.session_state["excel_file"] = generate_excel(dataframe)
+        if PUBLIC_MODE:
+            reset_payment_state(st.session_state, len(dataframe))
+        st.rerun()
+
+    dataframe = st.session_state["documents_dataframe"]
+    if not isinstance(dataframe, pd.DataFrame):
+        return
+
+    if PUBLIC_MODE:
+        render_public_mode(dataframe)
+    else:
+        render_internal_mode(dataframe)
+
+
+if __name__ == "__main__":
+    main()
