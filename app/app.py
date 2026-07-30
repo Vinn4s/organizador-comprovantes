@@ -435,7 +435,7 @@ def refresh_payment_status(state: MutableMapping[str, object]) -> str:
 
 
 st.set_page_config(
-    page_title="Organizador de Comprovantes",
+    page_title="Organizador de Comprovantes em Excel | ComprovaFácil",
     page_icon="📄",
     layout="wide",
 )
@@ -1381,10 +1381,12 @@ def main() -> None:
     PUBLIC_MODE = st.secrets.get("PUBLIC_MODE", False)
     initialize_session_state(st.session_state)
 
-    st.title("Organizador de Comprovantes")
-    st.caption(
-        "Envie comprovantes em PDF ou imagem para iniciar a organização."
-    )
+    st.title("Organize seus comprovantes em uma planilha Excel")
+    st.text(
+    "Envie comprovantes Pix, recibos, PDFs, fotos ou prints e receba "
+    "uma planilha Excel organizada com data, valor, pagador, recebedor, "
+    "referência e possíveis duplicidades."
+)
 
     uploaded_files = st.file_uploader(
         "Selecione os documentos",
