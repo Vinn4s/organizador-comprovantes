@@ -135,8 +135,10 @@ def select_package(file_count: int) -> tuple[str, float]:
     if not 1 <= file_count <= 300:
         raise ValueError("Envie entre 1 e 300 arquivos por lote.")
 
+    if file_count <= 5:
+        return "1 a 5 arquivos", 9.90
     if file_count <= 15:
-        return "1 a 15 arquivos", 19.90
+        return "6 a 15 arquivos", 19.90
     if file_count <= 50:
         return "16 a 50 arquivos", 49.90
     if file_count <= 120:
@@ -1308,10 +1310,6 @@ def render_public_mode(dataframe: pd.DataFrame) -> None:
         dataframe["Possível duplicidade"].eq("Sim").sum()
     )
 
-    st.warning(
-        "Não feche nem recarregue esta página até concluir o pagamento "
-        "e baixar sua planilha."
-    )
     st.success(f"{file_count} documento(s) processado(s).")
     metric_columns = st.columns(4)
     metric_columns[0].metric("Arquivos", file_count)
@@ -1343,6 +1341,11 @@ def render_public_mode(dataframe: pd.DataFrame) -> None:
         )
 
     if not st.session_state["payment_url"]:
+        st.info(
+            "Não feche nem atualize esta página antes de concluir o "
+            "pagamento e baixar sua planilha. O processamento permanece "
+            "disponível somente durante esta sessão."
+        )
         if st.button("Ir para pagamento", type="primary"):
             try:
                 ensure_payment_preference(st.session_state, file_count)
@@ -1358,6 +1361,11 @@ def render_public_mode(dataframe: pd.DataFrame) -> None:
 
     payment_url = st.session_state["payment_url"]
     if isinstance(payment_url, str):
+        st.info(
+            "Não feche nem atualize esta página antes de concluir o "
+            "pagamento e baixar sua planilha. O processamento permanece "
+            "disponível somente durante esta sessão."
+        )
         st.link_button("Abrir pagamento em nova aba", payment_url)
         st.caption(
             "Conclua o pagamento na nova aba e volte aqui para confirmar."
@@ -1376,6 +1384,53 @@ def render_public_mode(dataframe: pd.DataFrame) -> None:
         payment_status_fragment()
 
 
+def render_public_information() -> None:
+    """Exibe orientações e avisos do fluxo público."""
+    st.subheader("Como funciona")
+    st.markdown(
+        "1. Envie comprovantes em PDF, JPG ou PNG.\n"
+        "2. Confira uma prévia protegida.\n"
+        "3. Realize o pagamento pelo Mercado Pago.\n"
+        "4. Baixe a planilha Excel organizada."
+    )
+
+    st.subheader("O que você recebe")
+    st.write(
+        "A planilha pode conter: data, valor, tipo de pagamento, pagador, "
+        "recebedor, CPF ou CNPJ, identificador da transação, referência, "
+        "descrição e possíveis duplicidades."
+    )
+
+
+def render_public_footer() -> None:
+    """Exibe avisos de privacidade e suporte ao final do modo público."""
+    st.divider()
+    st.subheader("Privacidade")
+    st.write(
+        "Os arquivos são usados durante a sessão para gerar a planilha."
+    )
+    st.write(
+        "O aplicativo não mantém um banco de dados com os documentos "
+        "enviados."
+    )
+
+    st.subheader("Informações importantes")
+    st.write(
+        "A extração é automática e deve ser conferida antes do uso da "
+        "planilha."
+    )
+    st.markdown(
+    """
+    ### Suporte
+
+    Teve algum problema com o processamento, pagamento ou download?  
+    Entre em contato pelo e-mail:
+
+    **[comprovafacil@gmail.com](mailto:comprovafacil@gmail.com)**
+    """
+    )
+
+
 def main() -> None:
     """Renderiza o modo interno ou público sem persistir arquivos enviados."""
     PUBLIC_MODE = st.secrets.get("PUBLIC_MODE", False)
@@ -1388,6 +1443,9 @@ def main() -> None:
     "referência e possíveis duplicidades."
 )
 
+    if PUBLIC_MODE:
+        render_public_information()
+
     uploaded_files = st.file_uploader(
         "Selecione os documentos",
         type=["pdf", "png", "jpg", "jpeg"],
@@ -1396,9 +1454,7 @@ def main() -> None:
 
     if not uploaded_files:
         st.info("Nenhum documento enviado ainda.")
-        return
-
-    if len(uploaded_files) > 300:
+    elif len(uploaded_files) > 300:
         st.error("O limite é de 300 arquivos por lote.")
     elif st.button("Ler documentos", type="primary"):
         dataframe = process_documents(uploaded_files)
@@ -1408,14 +1464,16 @@ def main() -> None:
             reset_payment_state(st.session_state, len(dataframe))
         st.rerun()
 
-    dataframe = st.session_state["documents_dataframe"]
-    if not isinstance(dataframe, pd.DataFrame):
-        return
+    if uploaded_files:
+        dataframe = st.session_state["documents_dataframe"]
+        if isinstance(dataframe, pd.DataFrame):
+            if PUBLIC_MODE:
+                render_public_mode(dataframe)
+            else:
+                render_internal_mode(dataframe)
 
     if PUBLIC_MODE:
-        render_public_mode(dataframe)
-    else:
-        render_internal_mode(dataframe)
+        render_public_footer()
 
 
 if __name__ == "__main__":

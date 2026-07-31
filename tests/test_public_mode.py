@@ -74,30 +74,32 @@ class PublicModeTests(unittest.TestCase):
             }
         )
 
-    def test_a_10_files_selects_19_90(self) -> None:
-        self.assertEqual(APP.select_package(10), ("1 a 15 arquivos", 19.90))
+    def test_a_package_price_boundaries(self) -> None:
+        expected_packages = [
+            (1, ("1 a 5 arquivos", 9.90)),
+            (5, ("1 a 5 arquivos", 9.90)),
+            (6, ("6 a 15 arquivos", 19.90)),
+            (15, ("6 a 15 arquivos", 19.90)),
+            (16, ("16 a 50 arquivos", 49.90)),
+            (50, ("16 a 50 arquivos", 49.90)),
+            (51, ("51 a 120 arquivos", 99.90)),
+            (120, ("51 a 120 arquivos", 99.90)),
+            (121, ("121 a 300 arquivos", 199.90)),
+            (300, ("121 a 300 arquivos", 199.90)),
+        ]
 
-    def test_b_15_files_selects_19_90(self) -> None:
-        self.assertEqual(APP.select_package(15), ("1 a 15 arquivos", 19.90))
+        for file_count, expected_package in expected_packages:
+            with self.subTest(file_count=file_count):
+                self.assertEqual(
+                    APP.select_package(file_count),
+                    expected_package,
+                )
 
-    def test_c_16_files_selects_49_90(self) -> None:
-        self.assertEqual(APP.select_package(16), ("16 a 50 arquivos", 49.90))
-
-    def test_d_50_files_selects_49_90(self) -> None:
-        self.assertEqual(APP.select_package(50), ("16 a 50 arquivos", 49.90))
-
-    def test_e_51_files_selects_99_90(self) -> None:
-        self.assertEqual(APP.select_package(51), ("51 a 120 arquivos", 99.90))
-
-    def test_f_121_files_selects_199_90(self) -> None:
-        self.assertEqual(
-            APP.select_package(121),
-            ("121 a 300 arquivos", 199.90),
-        )
-
-    def test_g_301_files_are_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            APP.select_package(301)
+    def test_b_invalid_package_counts_are_rejected(self) -> None:
+        for file_count in (0, 301):
+            with self.subTest(file_count=file_count):
+                with self.assertRaises(ValueError):
+                    APP.select_package(file_count)
 
     def test_h_pending_payment_does_not_release_excel(self) -> None:
         state: dict[str, object] = {}
