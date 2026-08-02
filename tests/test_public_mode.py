@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import unittest
 from decimal import Decimal
@@ -504,6 +505,114 @@ class PublicModeTests(unittest.TestCase):
             str(error_context.exception),
             "Não foi possível iniciar o pagamento agora. Tente novamente.",
         )
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_environment_value_has_priority_over_streamlit_secrets(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {"PAYMENT_ENVIRONMENT": "sandbox"},
+                clear=True,
+            ),
+            patch.object(
+                APP.st,
+                "secrets",
+                {"PAYMENT_ENVIRONMENT": "production"},
+            ),
+        ):
+            self.assertEqual(
+                APP.get_config_value("PAYMENT_ENVIRONMENT"),
+                "sandbox",
+            )
+
+    def test_streamlit_secrets_are_used_when_environment_is_absent(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                APP.st,
+                "secrets",
+                {"PAYMENT_ENVIRONMENT": "sandbox"},
+            ),
+        ):
+            self.assertEqual(
+                APP.get_config_value("PAYMENT_ENVIRONMENT"),
+                "sandbox",
+            )
+
+    def test_missing_required_configuration_has_safe_error(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(APP.st, "secrets", {}),
+            self.assertRaises(APP.ConfigurationError) as error_context,
+        ):
+            APP.get_config_value("MERCADO_PAGO_ACCESS_TOKEN", required=True)
+
+        self.assertNotIn("MERCADO_PAGO_ACCESS_TOKEN", str(error_context.exception))
+
+    def test_configuration_error_is_a_payment_service_error(self) -> None:
+        self.assertTrue(
+            issubclass(APP.ConfigurationError, APP.PaymentServiceError)
+        )
+
+    def test_missing_optional_configuration_uses_default_without_secrets_file(
+        self,
+    ) -> None:
+        unavailable_secrets = MagicMock()
+        unavailable_secrets.get.side_effect = FileNotFoundError()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(APP.st, "secrets", unavailable_secrets),
+        ):
+            self.assertEqual(
+                APP.get_config_value(
+                    "PAYMENT_ENVIRONMENT",
+                    default="production",
+                ),
+                "production",
+            )
+
+    def test_public_mode_boolean_conversion(self) -> None:
+        for value in ("true", "1", "yes", "on"):
+            with self.subTest(value=value):
+                self.assertTrue(APP.parse_boolean(value))
+
+        for value in ("false", "0", "no", "off", ""):
+            with self.subTest(value=value):
+                self.assertFalse(APP.parse_boolean(value))
+
+    def test_public_mode_integer_boolean_conversion(self) -> None:
+        self.assertFalse(APP.parse_boolean(0))
+        self.assertTrue(APP.parse_boolean(1))
+
+    def test_invalid_public_mode_raises_safe_configuration_error(self) -> None:
+        with self.assertRaises(APP.ConfigurationError) as error_context:
+            APP.parse_boolean("treu")
+
+        self.assertNotIn("treu", str(error_context.exception))
+
+    def test_missing_token_stops_preference_before_http_request(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(APP.st, "secrets", {}),
+            patch.object(APP.requests, "post") as post,
+            self.assertRaises(APP.PaymentServiceError),
+        ):
+            APP.create_payment_preference("order-1", 10)
+
+        post.assert_not_called()
+
+    def test_missing_token_stops_status_check_before_http_request(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(APP.st, "secrets", {}),
+            patch.object(APP.requests, "get") as get,
+            self.assertRaises(APP.PaymentServiceError),
+        ):
+            APP.check_payment_status("order-1", Decimal("19.90"))
+
+        get.assert_not_called()
 
 
 if __name__ == "__main__":

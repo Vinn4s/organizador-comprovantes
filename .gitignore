@@ -2,6 +2,13 @@ app/.venv/
 __pycache__/
 *.pyc
 .env
+.env.*
+**/secrets.toml
+*.pem
+*.key
+*.p12
+credentials*.json
+service-account*.json
 product/test-files/*
 !product/test-files/.gitkeep
 .streamlit/secrets.toml

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from collections.abc import MutableMapping
@@ -52,10 +53,62 @@ PUBLIC_FOUND_FIELD_COLUMNS = [
     "Recebedor",
     "Descrição",
 ]
+_CONFIG_MISSING = object()
 
 
 class PaymentServiceError(Exception):
     """Erro seguro para exibição durante a comunicação de pagamento."""
+
+
+class ConfigurationError(PaymentServiceError):
+    """Erro seguro para uma configuração obrigatória ou inválida."""
+
+
+def get_config_value(
+    name: str,
+    *,
+    default: object = _CONFIG_MISSING,
+    required: bool = False,
+) -> object:
+    """Lê configuração do ambiente ou, como fallback, do Streamlit.
+
+    Variáveis de ambiente têm prioridade para permitir o uso de secrets do
+    Cloud Run, preservando o suporte a ``.streamlit/secrets.toml`` local e ao
+    Streamlit Community Cloud.
+    """
+    value = os.getenv(name)
+    if value is None:
+        try:
+            value = st.secrets.get(name)
+        except (AttributeError, FileNotFoundError, KeyError, OSError):
+            value = None
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if required:
+            raise ConfigurationError(
+                "A configuração necessária para pagamentos não está disponível."
+            )
+        return None if default is _CONFIG_MISSING else default
+
+    return value
+
+
+def parse_boolean(value: object) -> bool:
+    """Converte valores textuais de configuração em booleano com segurança."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized_value = value.strip().lower()
+        if normalized_value in {"true", "1", "yes", "on"}:
+            return True
+        if normalized_value in {"false", "0", "no", "off", ""}:
+            return False
+    if isinstance(value, int):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+    raise ConfigurationError("A configuração informada é inválida.")
 
 
 def is_sandbox_environment(environment: str) -> bool:
@@ -270,9 +323,12 @@ def create_payment_preference(
 ) -> tuple[str, str]:
     """Cria uma preferência Checkout Pro sem expor detalhes sensíveis."""
     _, price = select_package(file_count)
-    access_token = st.secrets["MERCADO_PAGO_ACCESS_TOKEN"]
+    access_token = get_config_value(
+        "MERCADO_PAGO_ACCESS_TOKEN",
+        required=True,
+    )
     environment = str(
-        st.secrets.get("PAYMENT_ENVIRONMENT", "production")
+        get_config_value("PAYMENT_ENVIRONMENT", default="production")
     ).lower()
     payload = {
         "items": [
@@ -370,7 +426,10 @@ def check_payment_status(
     expected_currency: str = PAYMENT_CURRENCY,
 ) -> str:
     """Libera somente pagamentos aprovados e idênticos ao pedido esperado."""
-    access_token = st.secrets["MERCADO_PAGO_ACCESS_TOKEN"]
+    access_token = get_config_value(
+        "MERCADO_PAGO_ACCESS_TOKEN",
+        required=True,
+    )
 
     try:
         response = requests.get(
@@ -1433,7 +1492,14 @@ def render_public_footer() -> None:
 
 def main() -> None:
     """Renderiza o modo interno ou público sem persistir arquivos enviados."""
-    PUBLIC_MODE = st.secrets.get("PUBLIC_MODE", False)
+    try:
+        public_mode = parse_boolean(
+            get_config_value("PUBLIC_MODE", default=False)
+        )
+    except ConfigurationError as error:
+        st.error(str(error))
+        st.stop()
+
     initialize_session_state(st.session_state)
 
     st.title("Organize seus comprovantes em uma planilha Excel")
@@ -1443,7 +1509,7 @@ def main() -> None:
     "referência e possíveis duplicidades."
 )
 
-    if PUBLIC_MODE:
+    if public_mode:
         render_public_information()
 
     uploaded_files = st.file_uploader(
@@ -1460,19 +1526,19 @@ def main() -> None:
         dataframe = process_documents(uploaded_files)
         st.session_state["documents_dataframe"] = dataframe
         st.session_state["excel_file"] = generate_excel(dataframe)
-        if PUBLIC_MODE:
+        if public_mode:
             reset_payment_state(st.session_state, len(dataframe))
         st.rerun()
 
     if uploaded_files:
         dataframe = st.session_state["documents_dataframe"]
         if isinstance(dataframe, pd.DataFrame):
-            if PUBLIC_MODE:
+            if public_mode:
                 render_public_mode(dataframe)
             else:
                 render_internal_mode(dataframe)
 
-    if PUBLIC_MODE:
+    if public_mode:
         render_public_footer()
 
 
